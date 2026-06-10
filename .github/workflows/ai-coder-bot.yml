@@ -1,0 +1,22 @@
+name: AI Coder Bot
+on:
+  issues:
+    types: [opened]
+permissions:
+  issues: write
+  contents: write
+  pull-requests: write
+jobs:
+  implement:
+    if: contains(github.event.issue.labels.*.name, 'feature')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Implement feature from issue
+        env:
+          GH_TOKEN: \${{ secrets.GITHUB_TOKEN }}
+          OPENROUTER_API_KEY: \${{ secrets.OPENROUTER_API_KEY }}
+          ISSUE_NUMBER: \${{ github.event.issue.number }}
+          REPO_FULL: \${{ github.repository }}
+        run: |
+          python3 /tmp/implement.py
