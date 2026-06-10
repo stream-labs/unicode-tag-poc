@@ -1,0 +1,79 @@
+name: ai-devops-bot
+on:
+  issues:
+    types: [opened]
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: write
+      pull-requests: write
+    steps:
+      - name: AI triages issue and takes action
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OPENROUTER_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          ISSUE_NUM: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          REPO: ${{ github.repository }}
+        run: |
+          ISSUE_BODY=$(gh api repos/$REPO/issues/$ISSUE_NUM --jq '.body')
+          PR_LIST=$(gh api repos/$REPO/pulls --jq '.[] | "  PR #\(.number): \(.title)"')
+          [ -z "$PR_LIST" ] && PR_LIST="  None"
+
+          RESPONSE=$(python3 << 'PY'
+          import json, urllib.request, os
+
+          or_key = os.environ["OPENROUTER_KEY"]
+          title = os.environ["ISSUE_TITLE"]
+          body = os.environ.get("ISSUE_BODY", "")
+          pr_list = os.environ.get("PR_LIST", "None")
+
+          prompt = [
+              {"role": "system", "content":
+                  "You are an AI DevOps assistant that triages issues and manages PRs.\n\n"
+                  "Available actions (include in your response when appropriate):\n"
+                  "- MERGE_PR #N — merge a pull request\n"
+                  "- LABEL <label> — add a label to this issue\n"
+                  "- CLOSE_ISSUE — close this issue\n\n"
+                  "Currently open PRs:\n" + pr_list + "\n\n"
+                  "Be concise and take action when the context is clear."},
+              {"role": "user", "content": f"New issue:\nTitle: {title}\nBody: {body}"}
+          ]
+
+          req = urllib.request.Request(
+              "https://openrouter.ai/api/v1/chat/completions",
+              data=json.dumps({
+                  "model": "anthropic/claude-sonnet-4",
+                  "messages": prompt, "max_tokens": 400
+              }).encode(),
+              headers={"Authorization": f"Bearer {or_key}",
+                       "Content-Type": "application/json"})
+          resp = json.loads(urllib.request.urlopen(req).read())
+          print(resp["choices"][0]["message"]["content"])
+          PY
+          )
+
+          echo "AI Response:"
+          echo "$RESPONSE"
+
+          # Execute MERGE_PR if the AI requested it
+          MERGE_NUM=$(echo "$RESPONSE" | grep -oP 'MERGE_PR\s*#?\K\d+' | head -1)
+          ACTIONS=""
+          if [ -n "$MERGE_NUM" ]; then
+            echo ">>> Merging PR #$MERGE_NUM..."
+            if gh api repos/$REPO/pulls/$MERGE_NUM/merge -X PUT -f merge_method=merge -f commit_message="Merged by AI bot (resolves #$ISSUE_NUM)" 2>/dev/null; then
+              echo ">>> PR #$MERGE_NUM merged!"
+              ACTIONS="Merged PR #$MERGE_NUM"
+            else
+              echo ">>> Merge failed"
+              ACTIONS="Attempted merge of PR #$MERGE_NUM (failed)"
+            fi
+          fi
+
+          # Post AI response as comment
+          COMMENT="**AI DevOps Bot:**\n\n$RESPONSE"
+          [ -n "$ACTIONS" ] && COMMENT="$COMMENT\n\n**Actions taken:** $ACTIONS"
+          COMMENT="$COMMENT\n\n---\n*Automated by AI DevOps Bot*"
+          gh api repos/$REPO/issues/$ISSUE_NUM/comments -f body="$(echo -e "$COMMENT")"
