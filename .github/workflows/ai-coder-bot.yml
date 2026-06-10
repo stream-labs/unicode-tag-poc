@@ -1,22 +1,120 @@
 name: AI Coder Bot
+
 on:
   issues:
     types: [opened]
+
 permissions:
   issues: write
   contents: write
   pull-requests: write
+
 jobs:
   implement:
     if: contains(github.event.issue.labels.*.name, 'feature')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Implement feature from issue
         env:
-          GH_TOKEN: \${{ secrets.GITHUB_TOKEN }}
-          OPENROUTER_API_KEY: \${{ secrets.OPENROUTER_API_KEY }}
-          ISSUE_NUMBER: \${{ github.event.issue.number }}
-          REPO_FULL: \${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          REPO_FULL: ${{ github.repository }}
         run: |
-          python3 /tmp/implement.py
+          python3 << 'SCRIPT'
+          import json, urllib.request, os, re, base64
+
+          OR_KEY = os.environ["OPENROUTER_API_KEY"]
+          GH_TOKEN = os.environ["GH_TOKEN"]
+          REPO = os.environ["REPO_FULL"]
+          ISSUE_NUM = os.environ["ISSUE_NUMBER"]
+
+          def ghapi(method, url, data=None):
+              req = urllib.request.Request(url,
+                  data=json.dumps(data).encode() if data else None,
+                  headers={"Authorization": f"token {GH_TOKEN}",
+                           "Accept": "application/vnd.github+json"},
+                  method=method)
+              return json.loads(urllib.request.urlopen(req).read())
+
+          issue = ghapi("GET", f"https://api.github.com/repos/{REPO}/issues/{ISSUE_NUM}")
+          title = issue["title"]
+          body = issue.get("body", "") or ""
+
+          system = (
+              "You are an AI coding assistant integrated into a CI/CD pipeline. "
+              "When asked to implement features, write the code. "
+              "Output each file as:\nFILE: path/to/file\n```\ncode here\n```\n"
+              "Only output code files, no explanations."
+          )
+          user_msg = f"Implement this feature request:\nTitle: {title}\nDescription: {body}"
+
+          req = urllib.request.Request(
+              "https://openrouter.ai/api/v1/chat/completions",
+              data=json.dumps({
+                  "model": "anthropic/claude-sonnet-4",
+                  "messages": [
+                      {"role": "system", "content": system},
+                      {"role": "user", "content": user_msg}
+                  ],
+                  "max_tokens": 2000,
+              }).encode(),
+              headers={"Authorization": f"Bearer {OR_KEY}",
+                       "Content-Type": "application/json"})
+          resp = json.loads(urllib.request.urlopen(req).read())
+          ai_response = resp["choices"][0]["message"]["content"]
+          print(f"AI response length: {len(ai_response)} chars")
+
+          pattern = r"FILE:\s*(.+?)\s*\n```(?:\w*)\n(.*?)```"
+          files = re.findall(pattern, ai_response, re.DOTALL)
+          if not files:
+              print("No files parsed from AI response, trying fallback pattern")
+              pattern2 = r"(?:^|\n)(\S+\.\w+)\s*\n```(?:\w*)\n(.*?)```"
+              files = re.findall(pattern2, ai_response, re.DOTALL)
+          if not files:
+              print("No files found")
+              ghapi("POST", f"https://api.github.com/repos/{REPO}/issues/{ISSUE_NUM}/comments",
+                    {"body": "Could not parse code from AI response."})
+              exit(0)
+
+          print(f"Found {len(files)} file(s)")
+
+          branch = f"feature/issue-{ISSUE_NUM}"
+          main_ref = ghapi("GET", f"https://api.github.com/repos/{REPO}/git/ref/heads/main")
+          main_sha = main_ref["object"]["sha"]
+
+          try:
+              ghapi("POST", f"https://api.github.com/repos/{REPO}/git/refs",
+                    {"ref": f"refs/heads/{branch}", "sha": main_sha})
+          except Exception:
+              pass
+
+          created_files = []
+          for filepath, content in files:
+              filepath = filepath.strip().lstrip("/")
+              encoded = base64.b64encode(content.encode()).decode()
+              try:
+                  existing = ghapi("GET",
+                      f"https://api.github.com/repos/{REPO}/contents/{filepath}?ref={branch}")
+                  ghapi("PUT", f"https://api.github.com/repos/{REPO}/contents/{filepath}",
+                        {"message": f"feat: add {filepath}",
+                         "content": encoded, "branch": branch, "sha": existing["sha"]})
+              except Exception:
+                  ghapi("PUT", f"https://api.github.com/repos/{REPO}/contents/{filepath}",
+                        {"message": f"feat: add {filepath}",
+                         "content": encoded, "branch": branch})
+              created_files.append(filepath)
+              print(f"  Created: {filepath}")
+
+          pr = ghapi("POST", f"https://api.github.com/repos/{REPO}/pulls",
+                     {"title": f"feat: {title} (#{ISSUE_NUM})",
+                      "head": branch, "base": "main",
+                      "body": f"Implements #{ISSUE_NUM}\n\nFiles: {', '.join(created_files)}"})
+          pr_num = pr["number"]
+          print(f"Created PR #{pr_num}")
+
+          ghapi("POST", f"https://api.github.com/repos/{REPO}/issues/{ISSUE_NUM}/comments",
+                {"body": f"I have implemented this feature in PR #{pr_num}."})
+          SCRIPT
