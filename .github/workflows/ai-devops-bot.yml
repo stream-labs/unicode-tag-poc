@@ -15,20 +15,40 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           OPENROUTER_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           ISSUE_NUM: ${{ github.event.issue.number }}
-          ISSUE_TITLE: ${{ github.event.issue.title }}
           REPO: ${{ github.repository }}
         run: |
-          ISSUE_BODY=$(gh api repos/$REPO/issues/$ISSUE_NUM --jq '.body')
-          PR_LIST=$(gh api repos/$REPO/pulls --jq '.[] | "  PR #\(.number): \(.title)"')
-          [ -z "$PR_LIST" ] && PR_LIST="  None"
+          python3 << 'PY'
+          import json, urllib.request, os, re
 
-          RESPONSE=$(python3 << 'PY'
-          import json, urllib.request, os
-
+          token = os.environ["GH_TOKEN"]
           or_key = os.environ["OPENROUTER_KEY"]
-          title = os.environ["ISSUE_TITLE"]
-          body = os.environ.get("ISSUE_BODY", "")
-          pr_list = os.environ.get("PR_LIST", "None")
+          repo = os.environ["REPO"]
+          num = os.environ["ISSUE_NUM"]
+
+          def ghapi(method, url, data=None):
+              payload = json.dumps(data).encode() if data else None
+              req = urllib.request.Request(url, data=payload, method=method,
+                  headers={"Authorization": f"token {token}",
+                           "Content-Type": "application/json",
+                           "Accept": "application/vnd.github+json"})
+              try:
+                  resp = urllib.request.urlopen(req)
+                  return json.loads(resp.read()), resp.status
+              except Exception as e:
+                  try: return json.loads(e.read().decode()), getattr(e, 'code', 0)
+                  except: return {"error": str(e)}, 0
+
+          issue, _ = ghapi("GET", f"https://api.github.com/repos/{repo}/issues/{num}")
+          title = issue.get("title", "")
+          body = issue.get("body", "")
+
+          prs, _ = ghapi("GET", f"https://api.github.com/repos/{repo}/pulls?state=open&per_page=10")
+          pr_list = ""
+          if isinstance(prs, list):
+              for p in prs:
+                  pr_list += f"  PR #{p['number']}: {p['title']}\n"
+          if not pr_list:
+              pr_list = "  None\n"
 
           prompt = [
               {"role": "system", "content":
@@ -37,7 +57,7 @@ jobs:
                   "- MERGE_PR #N — merge a pull request\n"
                   "- LABEL <label> — add a label to this issue\n"
                   "- CLOSE_ISSUE — close this issue\n\n"
-                  "Currently open PRs:\n" + pr_list + "\n\n"
+                  "Currently open PRs:\n" + pr_list + "\n"
                   "Be concise and take action when the context is clear."},
               {"role": "user", "content": f"New issue:\nTitle: {title}\nBody: {body}"}
           ]
@@ -51,29 +71,33 @@ jobs:
               headers={"Authorization": f"Bearer {or_key}",
                        "Content-Type": "application/json"})
           resp = json.loads(urllib.request.urlopen(req).read())
-          print(resp["choices"][0]["message"]["content"])
+          ai_text = resp["choices"][0]["message"]["content"]
+
+          print("AI Response:")
+          print(ai_text)
+
+          actions = []
+          merge_m = re.search(r"MERGE_PR\s*#?(\d+)", ai_text)
+          if merge_m:
+              pr_id = merge_m.group(1)
+              print(f"\n>>> Merging PR #{pr_id}...")
+              merge_r, merge_s = ghapi("PUT",
+                  f"https://api.github.com/repos/{repo}/pulls/{pr_id}/merge",
+                  {"merge_method": "merge",
+                   "commit_message": f"Merged by AI bot (resolves #{num})"})
+              merged = merge_r.get("merged", False) if isinstance(merge_r, dict) else False
+              if merged:
+                  print(f">>> PR #{pr_id} merged!")
+                  actions.append(f"Merged PR #{pr_id}")
+              else:
+                  msg = merge_r.get("message", "?") if isinstance(merge_r, dict) else "?"
+                  print(f">>> Merge failed: {msg}")
+                  actions.append(f"Merge PR #{pr_id} failed: {msg}")
+
+          comment = f"**AI DevOps Bot:**\n\n{ai_text}"
+          if actions:
+              comment += "\n\n**Actions taken:** " + ", ".join(actions)
+          comment += "\n\n---\n*Automated by AI DevOps Bot*"
+          ghapi("POST", f"https://api.github.com/repos/{repo}/issues/{num}/comments",
+                {"body": comment})
           PY
-          )
-
-          echo "AI Response:"
-          echo "$RESPONSE"
-
-          # Execute MERGE_PR if the AI requested it
-          MERGE_NUM=$(echo "$RESPONSE" | grep -oP 'MERGE_PR\s*#?\K\d+' | head -1)
-          ACTIONS=""
-          if [ -n "$MERGE_NUM" ]; then
-            echo ">>> Merging PR #$MERGE_NUM..."
-            if gh api repos/$REPO/pulls/$MERGE_NUM/merge -X PUT -f merge_method=merge -f commit_message="Merged by AI bot (resolves #$ISSUE_NUM)" 2>/dev/null; then
-              echo ">>> PR #$MERGE_NUM merged!"
-              ACTIONS="Merged PR #$MERGE_NUM"
-            else
-              echo ">>> Merge failed"
-              ACTIONS="Attempted merge of PR #$MERGE_NUM (failed)"
-            fi
-          fi
-
-          # Post AI response as comment
-          COMMENT="**AI DevOps Bot:**\n\n$RESPONSE"
-          [ -n "$ACTIONS" ] && COMMENT="$COMMENT\n\n**Actions taken:** $ACTIONS"
-          COMMENT="$COMMENT\n\n---\n*Automated by AI DevOps Bot*"
-          gh api repos/$REPO/issues/$ISSUE_NUM/comments -f body="$(echo -e "$COMMENT")"
